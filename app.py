@@ -5,7 +5,8 @@ import signal
 import subprocess
 import datetime
 import psutil
-from flask import Flask, request, jsonify, render_template_string, send_from_directory
+import threading
+from flask import Flask, request, jsonify, render_template_string, send_from_directory, Response
 
 # --- Configuration ---
 VIDEO_DEVICE = "/dev/video0"
@@ -22,6 +23,7 @@ class RecorderState:
         self.current_filepath = ""
         self.status = "IDLE"
         self.log_fd = None
+        self.timer = None
 
 recorder = RecorderState()
 
@@ -44,6 +46,46 @@ def get_mounted_drives():
             continue
     return drives
 
+def stop_recording_logic():
+    if recorder.process is None:
+        return "NOT_RECORDING"
+
+    # Cancel the timer if stop was triggered manually
+    if recorder.timer is not None:
+        recorder.timer.cancel()
+        recorder.timer = None
+
+    try:
+        os.killpg(os.getpgid(recorder.process.pid), signal.SIGINT)
+        # 120 SECOND TIMEOUT FIX: Prevents MP4 header corruption on large files
+        recorder.process.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        os.killpg(os.getpgid(recorder.process.pid), signal.SIGKILL)
+    except Exception:
+        pass
+    finally:
+        recorder.process = None
+        if recorder.log_fd:
+            recorder.log_fd.close()
+            recorder.log_fd = None
+
+    os.sync()
+    
+    final_status = f"STOPPED: Saved {recorder.current_filename}"
+    if os.path.exists(recorder.current_filepath):
+        file_size_kb = os.path.getsize(recorder.current_filepath) / 1024
+        if file_size_kb < 500:
+            final_status = f"WARNING: {recorder.current_filename} is empty ({int(file_size_kb)} KB). HDCP blocking signal?"
+
+    with open(LOG_FILE, 'a') as f:
+        f.write(f"\n--- Recording gracefully stopped. {final_status} ---\n")
+
+    recorder.status = final_status
+    recorder.current_filename = ""
+    recorder.current_filepath = ""
+    
+    return final_status
+
 # --- Web UI ---
 HTML_PAGE = """
 <!DOCTYPE html>
@@ -64,6 +106,9 @@ HTML_PAGE = """
         .btn-refresh { background-color: #6c757d; padding: 8px; font-size: 13px; margin-top: 6px; }
         .btn-close-video { background-color: #6c757d; padding: 10px; margin-top: 10px; }
         .status-box { margin-top: 20px; padding: 12px; border-radius: 6px; background-color: #e9ecef; font-weight: 600; font-size: 14px; word-break: break-all; text-align: center;}
+        
+        .flex-row { display: flex; gap: 10px; }
+        .flex-row input { width: 50%; }
         
         .file-list { margin-top: 20px; text-align: left; }
         .file-list h3 { font-size: 16px; margin-bottom: 10px; border-bottom: 2px solid #e9ecef; padding-bottom: 5px;}
@@ -100,6 +145,12 @@ HTML_PAGE = """
         <label for="recordName">3. Video Name:</label>
         <input type="text" id="recordName" placeholder="e.g. gameplay_1">
 
+        <label>4. Auto-Stop Timer (Optional):</label>
+        <div class="flex-row">
+            <input type="number" id="timerMin" placeholder="Minutes" min="0">
+            <input type="number" id="timerSec" placeholder="Seconds" min="0">
+        </div>
+
         <button class="btn-start" onclick="startRecording()">Start Recording</button>
         <button class="btn-stop" onclick="stopRecording()">Stop Recording</button>
         
@@ -107,7 +158,6 @@ HTML_PAGE = """
             Status: <span id="statusText">Checking...</span>
         </div>
 
-        <!-- Video Player Section -->
         <div class="video-modal" id="videoModal">
             <h4 id="videoTitle">Video Title</h4>
             <video id="videoPlayer" width="100%" controls style="border-radius: 4px; background: black;">
@@ -128,6 +178,8 @@ HTML_PAGE = """
     </div>
 
     <script>
+        let lastStatus = "";
+
         async function loadDrives() {
             try {
                 let res = await fetch('/drives');
@@ -184,7 +236,7 @@ HTML_PAGE = """
                                     <a href="#" class="btn-rename" onclick="renameFile('${encDrive}', '${encSub}', '${encName}'); return false;">✎</a>
                                     <a href="#" class="btn-delete" onclick="deleteFile('${encDrive}', '${encSub}', '${encName}'); return false;">✖</a>
                                 </div>
-                             </li>`;
+                            </li>`;
                 });
                 list.innerHTML = html;
             } catch (e) { console.error(e); }
@@ -204,7 +256,6 @@ HTML_PAGE = """
 
         async function renameFile(drive, subfolder, oldFile) {
             let decodedOld = decodeURIComponent(oldFile);
-            // Strip .mp4 for the prompt so it's cleaner to edit
             let cleanName = decodedOld.replace(/\.mp4$/i, '');
             let newName = prompt(`Enter new name for this video:`, cleanName);
             
@@ -251,6 +302,12 @@ HTML_PAGE = """
                 } else {
                     statusEl.style.color = "#333";
                 }
+
+                if (lastStatus && lastStatus.includes("RECORDING") && data.status.includes("STOPPED")) {
+                    setTimeout(fetchFiles, 1000);
+                }
+                lastStatus = data.status;
+
             } catch (e) { document.getElementById('statusText').innerText = 'Connection Error'; }
         }
 
@@ -272,6 +329,9 @@ HTML_PAGE = """
             let drive = document.getElementById('driveSelect').value;
             let subfolder = document.getElementById('subfolder').value;
             let name = document.getElementById('recordName').value;
+            let timerMin = parseInt(document.getElementById('timerMin').value) || 0;
+            let timerSec = parseInt(document.getElementById('timerSec').value) || 0;
+            let duration = (timerMin * 60) + timerSec;
 
             if (!drive) {
                 alert('Please connect a drive and select it first.');
@@ -281,7 +341,7 @@ HTML_PAGE = """
             await fetch('/start', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ drive: drive, subfolder: subfolder, name: name })
+                body: JSON.stringify({ drive: drive, subfolder: subfolder, name: name, duration: duration })
             });
             fetchStatus();
         }
@@ -351,7 +411,44 @@ def play_file():
     filename = request.args.get('file', '').strip()
     
     target_dir = os.path.join(base_mount, subfolder) if subfolder else base_mount
-    return send_from_directory(target_dir, filename)
+    filepath = os.path.join(target_dir, filename)
+    
+    if not os.path.exists(filepath):
+        return "File not found", 404
+
+    file_size = os.path.getsize(filepath)
+    range_header = request.headers.get('Range', None)
+    
+    if not range_header:
+        return send_from_directory(target_dir, filename)
+        
+    byte1, byte2 = 0, None
+    m = re.search(r'(\d+)-(\d*)', range_header)
+    if m:
+        g = m.groups()
+        if g[0]: byte1 = int(g[0])
+        if g[1]: byte2 = int(g[1])
+
+    if byte2 is None:
+        byte2 = file_size - 1
+        
+    length = byte2 - byte1 + 1
+    
+    def generate():
+        with open(filepath, 'rb') as f:
+            f.seek(byte1)
+            remaining = length
+            while remaining > 0:
+                chunk_size = min(remaining, 1024 * 1024)
+                data = f.read(chunk_size)
+                if not data: break
+                remaining -= len(data)
+                yield data
+
+    rv = Response(generate(), 206, mimetype='video/mp4', direct_passthrough=True)
+    rv.headers.add('Content-Range', f'bytes {byte1}-{byte2}/{file_size}')
+    rv.headers.add('Accept-Ranges', 'bytes')
+    return rv
 
 @app.route('/delete', methods=['POST'])
 def delete_file():
@@ -379,7 +476,6 @@ def rename_file():
     old_file = data.get("old_file", "").strip()
     new_file_raw = data.get("new_file", "").strip()
     
-    # Ensure we always keep the .mp4 extension and sanitize the new name
     clean_new_name = sanitize_name(new_file_raw.replace('.mp4', '').replace('.MP4', ''))
     new_file = f"{clean_new_name}.{VIDEO_CONTAINER}"
 
@@ -397,6 +493,9 @@ def rename_file():
 
 @app.route('/status', methods=['GET'])
 def get_status():
+    if recorder.process is not None and recorder.process.poll() is not None:
+        recorder.process = None
+        recorder.status = "IDLE (Process ended unexpectedly)"
     return jsonify({"status": recorder.status})
 
 @app.route('/log', methods=['GET'])
@@ -420,6 +519,7 @@ def start():
     base_mount = data.get("drive", "").strip()
     subfolder = data.get("subfolder", "").strip()
     custom_title = data.get("name", "")
+    duration_seconds = int(data.get("duration", 0))
 
     if not base_mount or not os.path.ismount(base_mount):
         recorder.status = f"ERROR: Invalid or unmounted drive '{base_mount}'"
@@ -437,6 +537,7 @@ def start():
     filename = f"{timestamp}_{title}.{VIDEO_CONTAINER}"
     output_filepath = os.path.join(target_dir, filename)
 
+    # UPDATED FFPEG COMMAND WITH LIVE A/V SYNC FILTER (-af aresample=async=1)
     cmd = [
         "ffmpeg", "-y",
         "-analyzeduration", "100M",
@@ -457,6 +558,7 @@ def start():
         "-b:a", "128k",
         "-ac", "2",
         "-ar", "44100",
+        "-af", "aresample=async=1",  # <-- LOCKS AUDIO TO VIDEO TIMESTAMPS
         "-movflags", "+faststart",
         output_filepath
     ]
@@ -464,6 +566,8 @@ def start():
     try:
         with open(LOG_FILE, 'w') as f:
             f.write(f"--- Starting new capture: {filename} ---\n")
+            if duration_seconds > 0:
+                f.write(f"--- Auto-Stop Timer set for {duration_seconds} seconds ---\n")
             f.write(f"Command: {' '.join(cmd)}\n\n")
 
         recorder.log_fd = open(LOG_FILE, 'a')
@@ -477,7 +581,14 @@ def start():
         )
         recorder.current_filename = filename
         recorder.current_filepath = output_filepath
-        recorder.status = f"RECORDING -> {output_filepath}"
+        
+        if duration_seconds > 0:
+            recorder.timer = threading.Timer(duration_seconds, stop_recording_logic)
+            recorder.timer.start()
+            recorder.status = f"RECORDING -> {filename} (Auto-stops in {duration_seconds}s)"
+        else:
+            recorder.status = f"RECORDING -> {filename}"
+
     except Exception as e:
         recorder.status = f"ERROR: {str(e)}"
 
@@ -485,36 +596,8 @@ def start():
 
 @app.route('/stop', methods=['POST'])
 def stop():
-    if recorder.process is None:
-        return jsonify({"status": "NOT_RECORDING"})
-
-    try:
-        os.killpg(os.getpgid(recorder.process.pid), signal.SIGINT)
-        recorder.process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        os.killpg(os.getpgid(recorder.process.pid), signal.SIGKILL)
-    finally:
-        recorder.process = None
-        if recorder.log_fd:
-            recorder.log_fd.close()
-            recorder.log_fd = None
-
-    os.sync()
-    
-    final_status = f"STOPPED: Saved {recorder.current_filename}"
-    if os.path.exists(recorder.current_filepath):
-        file_size_kb = os.path.getsize(recorder.current_filepath) / 1024
-        if file_size_kb < 500:
-            final_status = f"WARNING: {recorder.current_filename} is empty ({int(file_size_kb)} KB). HDCP blocking signal?"
-
-    with open(LOG_FILE, 'a') as f:
-        f.write(f"\n--- Recording gracefully stopped. {final_status} ---\n")
-
-    recorder.status = final_status
-    recorder.current_filename = ""
-    recorder.current_filepath = ""
-    
-    return jsonify({"status": final_status})
+    status_msg = stop_recording_logic()
+    return jsonify({"status": status_msg})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
